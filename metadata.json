@@ -1,0 +1,6 @@
+{
+  "name": "TTS Floating Reader & Studio",
+  "description": "Text to speech reader with floating bubble, multi-engine selection, paragraph tracking, MP3/WAV audio export, history search, and local WebDAV cloud sync.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
