@@ -14,9 +14,12 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
@@ -48,6 +51,9 @@ import kotlin.math.hypot
 class FloatingBubbleService : Service() {
     private val tag = "FloatingBubbleService"
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var longPressRunnable: Runnable? = null
+    private var longPressTriggered = false
 
     private var windowManager: WindowManager? = null
     private var bubbleView: View? = null
@@ -69,6 +75,22 @@ class FloatingBubbleService : Service() {
     private var initialY: Int = 0
     private var initialTouchX: Float = 0f
     private var initialTouchY: Float = 0f
+    private var cachedClipboardText: String = ""
+
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            if (cm != null && cm.hasPrimaryClip()) {
+                val item = cm.primaryClip?.getItemAt(0)
+                val text = item?.coerceToText(this)?.toString()
+                if (!text.isNullOrBlank()) {
+                    cachedClipboardText = text
+                }
+            }
+        } catch (e: Exception) {
+            Log.d(tag, "Clip listener exception: ${e.message}")
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -77,6 +99,19 @@ class FloatingBubbleService : Service() {
         ttsManager = TtsManager.getInstance(this)
         appSettings = AppSettingsRepository.getInstance(this)
         windowManager = getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+
+        try {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            clipboard?.addPrimaryClipChangedListener(clipListener)
+            if (clipboard != null && clipboard.hasPrimaryClip()) {
+                val clipText = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
+                if (!clipText.isNullOrBlank()) {
+                    cachedClipboardText = clipText
+                }
+            }
+        } catch (e: Exception) {
+            Log.d(tag, "Error adding clip listener: ${e.message}")
+        }
 
         createNotificationChannel()
 
@@ -540,7 +575,7 @@ class FloatingBubbleService : Service() {
         container.addView(bubbleFrame)
         container.addView(expandedPanel)
 
-        // 3. Touch & Drag-to-Close gesture handling
+        // 3. Touch & Drag-to-Close gesture handling (2-second hold to reveal controls panel)
         bubbleFrame.setOnTouchListener { _, event ->
             val curParams = params ?: return@setOnTouchListener false
             when (event.action) {
@@ -551,6 +586,22 @@ class FloatingBubbleService : Service() {
                     initialTouchY = event.rawY
                     isDragging = false
                     isInDismissZone = false
+                    longPressTriggered = false
+
+                    // Schedule long-press for 2 seconds (2000ms) to show/hide controls panel
+                    longPressRunnable = Runnable {
+                        if (!isDragging) {
+                            longPressTriggered = true
+                            isExpanded = !isExpanded
+                            expandedPanel.visibility = if (isExpanded) View.VISIBLE else View.GONE
+                            try {
+                                bubbleFrame.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                            } catch (ignored: Exception) {}
+                            val msg = if (isExpanded) "Panel de controles mostrado" else "Panel de controles ocultado"
+                            Toast.makeText(this@FloatingBubbleService, msg, Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    mainHandler.postDelayed(longPressRunnable!!, 2000L)
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
@@ -558,6 +609,7 @@ class FloatingBubbleService : Service() {
                     val deltaY = (event.rawY - initialTouchY).toInt()
 
                     if (Math.abs(deltaX) > 12 || Math.abs(deltaY) > 12) {
+                        longPressRunnable?.let { mainHandler.removeCallbacks(it) }
                         if (!isDragging) {
                             isDragging = true
                             showDismissTarget()
@@ -590,17 +642,18 @@ class FloatingBubbleService : Service() {
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    longPressRunnable?.let { mainHandler.removeCallbacks(it) }
                     hideDismissTarget()
 
                     if (isInDismissZone) {
                         // Dropped on dismiss target -> Close/hide bubble
                         Toast.makeText(this@FloatingBubbleService, "Burbuja flotante cerrada", Toast.LENGTH_SHORT).show()
                         stopSelf()
+                    } else if (longPressTriggered) {
+                        // 2-second hold already toggled the controls panel
                     } else if (!isDragging) {
-                        // Regular tap on circular bubble: READ CLIPBOARD & TOGGLE CONTROLS
+                        // Regular tap on circular bubble: READ & PLAY CLIPBOARD IMMEDIATELY
                         readClipboardContent()
-                        isExpanded = !isExpanded
-                        expandedPanel.visibility = if (isExpanded) View.VISIBLE else View.GONE
                     } else {
                         // Drag ended elsewhere -> Snap smoothly to left or right screen edge
                         val (screenWidth, _) = getScreenDimensions()
@@ -614,6 +667,7 @@ class FloatingBubbleService : Service() {
                     }
                     isDragging = false
                     isInDismissZone = false
+                    longPressTriggered = false
                     true
                 }
                 else -> false
@@ -654,41 +708,62 @@ class FloatingBubbleService : Service() {
     private fun pasteClipboardToTts(): Boolean {
         try {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            if (clipboard == null || !clipboard.hasPrimaryClip()) {
-                Toast.makeText(this, "El portapapeles está vacío", Toast.LENGTH_SHORT).show()
-                return false
-            }
-
-            val clipData = clipboard.primaryClip
-            if (clipData != null && clipData.itemCount > 0) {
-                val text = clipData.getItemAt(0).coerceToText(this)?.toString()
-                if (!text.isNullOrBlank()) {
-                    ttsManager.playText(text, startIndex = 0)
-                    val preview = if (text.length > 30) "${text.take(30)}..." else text
-                    Toast.makeText(this, "Reproduciendo: \"$preview\"", Toast.LENGTH_SHORT).show()
-                    return true
+            if (clipboard != null && clipboard.hasPrimaryClip()) {
+                val clipData = clipboard.primaryClip
+                if (clipData != null && clipData.itemCount > 0) {
+                    val text = clipData.getItemAt(0).coerceToText(this)?.toString()
+                    if (!text.isNullOrBlank()) {
+                        ttsManager.playText(text, startIndex = 0)
+                        val preview = if (text.length > 30) "${text.take(30)}..." else text
+                        Toast.makeText(this, "Reproduciendo: \"$preview\"", Toast.LENGTH_SHORT).show()
+                        return true
+                    }
                 }
             }
         } catch (e: Exception) {
-            Log.e(tag, "Clipboard paste error", e)
+            Log.d(tag, "Direct clipboard read not available in background: ${e.message}")
         }
 
-        Toast.makeText(this, "No se encontró texto legible en el portapapeles", Toast.LENGTH_SHORT).show()
-        return false
+        // On Android 10+ background processes cannot read clipboard without focus.
+        // Launch TransparentClipboardActivity to temporarily gain focus and read clipboard seamlessly.
+        try {
+            val intent = Intent(this, TransparentClipboardActivity::class.java).apply {
+                action = TransparentClipboardActivity.ACTION_PASTE_AND_PLAY
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION
+            }
+            startActivity(intent)
+            return true
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to launch TransparentClipboardActivity", e)
+            Toast.makeText(this, "No se encontró texto en el portapapeles", Toast.LENGTH_SHORT).show()
+            return false
+        }
     }
 
     private fun recordCurrentTextToAudio() {
         var textToExport = ttsManager.state.value.fullText
         if (textToExport.isBlank()) {
-            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            if (clipboard != null && clipboard.hasPrimaryClip() && (clipboard.primaryClip?.itemCount ?: 0) > 0) {
-                textToExport = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString() ?: ""
-            }
+            try {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                if (clipboard != null && clipboard.hasPrimaryClip() && (clipboard.primaryClip?.itemCount ?: 0) > 0) {
+                    textToExport = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString() ?: ""
+                }
+            } catch (ignored: Exception) {}
         }
 
         if (textToExport.isBlank()) {
-            Toast.makeText(this, "No hay texto para grabar. Copia o pega un texto primero.", Toast.LENGTH_SHORT).show()
-            return
+            // Try via TransparentClipboardActivity
+            try {
+                val intent = Intent(this, TransparentClipboardActivity::class.java).apply {
+                    action = TransparentClipboardActivity.ACTION_PASTE_AND_RECORD
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION
+                }
+                startActivity(intent)
+                return
+            } catch (e: Exception) {
+                Toast.makeText(this, "No hay texto para grabar. Copia o pega un texto primero.", Toast.LENGTH_SHORT).show()
+                return
+            }
         }
 
         val lastFormat = appSettings.lastExportFormat.value.ifBlank { "MP3" }
@@ -778,26 +853,22 @@ class FloatingBubbleService : Service() {
     private fun readClipboardContent(): Boolean {
         try {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            if (clipboard == null || !clipboard.hasPrimaryClip()) {
-                Toast.makeText(this, "El portapapeles está vacío", Toast.LENGTH_SHORT).show()
-                return false
-            }
-
-            val clipData = clipboard.primaryClip
-            if (clipData != null && clipData.itemCount > 0) {
-                val text = clipData.getItemAt(0).coerceToText(this)?.toString()
-                if (!text.isNullOrBlank()) {
-                    Toast.makeText(this, "Leyendo portapapeles...", Toast.LENGTH_SHORT).show()
-                    ttsManager.playText(text, startIndex = 0)
-                    return true
+            if (clipboard != null && clipboard.hasPrimaryClip()) {
+                val clipData = clipboard.primaryClip
+                if (clipData != null && clipData.itemCount > 0) {
+                    val text = clipData.getItemAt(0)?.coerceToText(this)?.toString()
+                    if (!text.isNullOrBlank()) {
+                        Toast.makeText(this, "Leyendo portapapeles...", Toast.LENGTH_SHORT).show()
+                        ttsManager.playText(text, startIndex = 0)
+                        return true
+                    }
                 }
             }
         } catch (e: Exception) {
-            Log.e(tag, "Clipboard access error", e)
+            Log.d(tag, "Clipboard direct access error: ${e.message}")
         }
 
-        Toast.makeText(this, "No se encontró texto legible en el portapapeles", Toast.LENGTH_SHORT).show()
-        return false
+        return pasteClipboardToTts()
     }
 
     private fun observeTtsState() {
@@ -856,6 +927,11 @@ class FloatingBubbleService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        mainHandler.removeCallbacksAndMessages(null)
+        try {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            clipboard?.removePrimaryClipChangedListener(clipListener)
+        } catch (ignored: Exception) {}
         ttsObserverJob?.cancel()
         serviceScope.cancel()
         hideDismissTarget()
